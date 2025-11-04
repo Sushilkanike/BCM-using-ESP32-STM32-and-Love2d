@@ -21,17 +21,28 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "i2c-lcd.h"
+#include "mpu6050.h"
+#include <stdio.h>
+#include <math.h>
+#include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 
+typedef struct {
+	char IMU_data[30];
+	char Can_Message[30];
+	char pots[15];
+	char buttons[6];
+}can_Payload;
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define NUM_ADC_CHANNELS 1
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -41,22 +52,60 @@
 
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
 
 I2C_HandleTypeDef hi2c1;
 
 SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
+// HAL will populate this buffer with ADC results:
+uint16_t pot_value;
+can_Payload can;
+MPU6050_Data mpu_data;
+char IMU_data[20];
+char lcd_buffer[20];
+
+volatile uint8_t can_buttons[6] = {0, 0, 0, 0, 0, 0};
+// Variables for button de-bouncing
+#define DEBOUNCE_TIME_MS 200 // 200ms de-bounce delay
+static volatile uint32_t last_press_time[6] = {0};
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
+
+void Update_LCD(void) {
+    //lcd_put_cur(0, 0); sprintf(lcd_buffer, "P%.1f I%.1f D%.1f", pid.Kp, pid.Ki, pid.Kd); lcd_send_string(lcd_buffer);
+    //lcd_put_cur(1, 0); sprintf(lcd_buffer, "Angle:%-6.1f %s", current_angle, pid_enabled ? "ON " : "OFF"); lcd_send_string(lcd_buffer);
+}
+
+void IMU_Init(void){
+	MPU6050_Init(&hi2c1);
+	MPU6050_Read_All(&hi2c1, &mpu_data);
+	sprintf(IMU_data, "X:%0.1f Y:%0.1f Z:%0.1f", mpu_data.Ax, mpu_data.Ay, mpu_data.Az);
+	strcpy(lcd_buffer, IMU_data);
+}
+
+void get_IMU(void){
+	MPU6050_Read_All(&hi2c1, &mpu_data);
+		sprintf(IMU_data, "X:%0.1f Y:%0.1f Z:%0.1f", mpu_data.Ax, mpu_data.Ay, mpu_data.Az);
+		strcpy(can.IMU_data, IMU_data);
+}
+
+void get_POT(void){
+
+	uint8_t maped_value = ((int32_t)pot_value * 100) / 4095;
+	sprintf(can.pots, "POT:%d", maped_value);
+
+}
 
 /* USER CODE END PFP */
 
@@ -94,17 +143,51 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_ADC1_Init();
   MX_I2C1_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
 
+  HAL_NVIC_DisableIRQ(DMA2_Stream0_IRQn);
+
+  lcd_init(&hi2c1);
+  lcd_put_cur(0, 0); // Set cursor to first row, first column
+  lcd_send_string("Initializing...");
+
+  IMU_Init();
+  lcd_put_cur(1,0);
+  lcd_send_string(lcd_buffer);
+
+  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)&pot_value, NUM_ADC_CHANNELS);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  lcd_clear();
   while (1)
   {
+	  sprintf(can.buttons, "%d%d%d%d%d%d",
+	          can_buttons[0],
+	          can_buttons[1],
+	          can_buttons[2],
+	          can_buttons[3],
+	          can_buttons[4],
+	          can_buttons[5]);
+
+	  get_POT();
+	  lcd_put_cur(0,0);
+	  sprintf(can.Can_Message, "%s %s", can.pots, can.buttons);
+	  lcd_send_string(can.Can_Message);
+
+	  get_IMU();
+	  lcd_put_cur(1,0);
+	  lcd_send_string(can.IMU_data);
+
+	  //lcd_put_cur(0,0);
+	  //lcd_send_string(can.buttons);
+	  HAL_Delay(10);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -182,13 +265,13 @@ static void MX_ADC1_Init(void)
   hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
   hadc1.Init.Resolution = ADC_RESOLUTION_12B;
   hadc1.Init.ScanConvMode = DISABLE;
-  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = ENABLE;
   hadc1.Init.DiscontinuousConvMode = DISABLE;
   hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
   hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
   hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
   hadc1.Init.NbrOfConversion = 1;
-  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.DMAContinuousRequests = ENABLE;
   hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
   if (HAL_ADC_Init(&hadc1) != HAL_OK)
   {
@@ -197,9 +280,9 @@ static void MX_ADC1_Init(void)
 
   /** Configure for the selected ADC regular channel its corresponding rank in the sequencer and its sample time.
   */
-  sConfig.Channel = ADC_CHANNEL_1;
+  sConfig.Channel = ADC_CHANNEL_2;
   sConfig.Rank = 1;
-  sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+  sConfig.SamplingTime = ADC_SAMPLETIME_480CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
   {
     Error_Handler();
@@ -283,6 +366,22 @@ static void MX_SPI1_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Stream0_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -321,13 +420,32 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(SPI_CS_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : PB0 PB1 PB2 PB3
+  /*Configure GPIO pins : PB0 PB1 PB10 PB3
                            PB4 PB5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_10|GPIO_PIN_3
                           |GPIO_PIN_4|GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_FALLING;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
+  /* EXTI interrupt init*/
+  HAL_NVIC_SetPriority(EXTI0_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI0_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI1_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI1_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI3_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
+
+  HAL_NVIC_SetPriority(EXTI15_10_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -335,6 +453,73 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  uint32_t current_time = HAL_GetTick(); // Get current time in milliseconds
+
+  switch (GPIO_Pin)
+  {
+    case GPIO_PIN_0:
+      // Check if debounce time has passed for PB0
+      if (current_time - last_press_time[0] > DEBOUNCE_TIME_MS)
+      {
+        can_buttons[0] ^= 1; // Toggle the value (0->1 or 1->0)
+        last_press_time[0] = current_time; // Update the last press time
+      }
+      break;
+
+    case GPIO_PIN_1:
+      // Check if debounce time has passed for PB1
+      if (current_time - last_press_time[1] > DEBOUNCE_TIME_MS)
+      {
+        can_buttons[1] ^= 1;
+        last_press_time[1] = current_time;
+      }
+      break;
+
+    case GPIO_PIN_10:
+      // Check if debounce time has passed for PB2
+      if (current_time - last_press_time[2] > DEBOUNCE_TIME_MS)
+      {
+        can_buttons[2] ^= 1;
+        last_press_time[2] = current_time;
+      }
+      break;
+
+    case GPIO_PIN_3:
+      // Check if debounce time has passed for PB3
+      if (current_time - last_press_time[3] > DEBOUNCE_TIME_MS)
+      {
+        can_buttons[3] ^= 1;
+        last_press_time[3] = current_time;
+      }
+      break;
+
+    case GPIO_PIN_4:
+      // Check if debounce time has passed for PB4
+      if (current_time - last_press_time[4] > DEBOUNCE_TIME_MS)
+      {
+        can_buttons[4] ^= 1;
+        last_press_time[4] = current_time;
+      }
+      break;
+
+    case GPIO_PIN_5:
+      // Check if debounce time has passed for PB5
+      if (current_time - last_press_time[5] > DEBOUNCE_TIME_MS)
+      {
+        can_buttons[5] ^= 1;
+        last_press_time[5] = current_time;
+      }
+      break;
+
+    default:
+      // Unhandled interrupt
+      __NOP(); // No Operation
+      break;
+  }
+}
 
 /* USER CODE END 4 */
 
