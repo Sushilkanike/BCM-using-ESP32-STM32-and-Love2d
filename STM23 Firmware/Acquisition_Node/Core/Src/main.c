@@ -186,8 +186,10 @@ int main(void)
   IMU_Init();
 
   MCP_Init();
-
-  HAL_ADC_Start_DMA(&hadc1, (uint32_t *)&pot_value, NUM_ADC_CHANNELS);
+  MCP_WriteByte(MCP_CANCTRL, 0x00); // NORMAL mode
+  while( (MCP_ReadByte(MCP_CANSTAT) & 0xE0) != 0x00 );
+  
+	HAL_ADC_Start_DMA(&hadc1, (uint32_t *)&pot_value, NUM_ADC_CHANNELS);
 
   /* USER CODE END 2 */
 
@@ -631,3 +633,4 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+
