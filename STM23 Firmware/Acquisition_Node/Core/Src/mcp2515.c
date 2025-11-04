@@ -227,15 +227,40 @@ static void MCP_Reset(void)
 
 static void MCP_SetBitrate(uint8_t clock_mhz, uint16_t bitrate_kbps)
 {
-    // These values are for a 8MHz crystal
-    // You can find calculators online for other values
-    // This is for 500kbps @ 8MHz
-    MCP_WriteByte(MCP_CNF1, 0x00); // SJW=1, BRP=0
-    MCP_WriteByte(MCP_CNF2, 0x90); // BTLMODE=1, SAM=0, PHSEG1=2, PRSEG=0
-    MCP_WriteByte(MCP_CNF3, 0x02); // SOF=0, WAKFIL=0, PHSEG2=2
-    
-    // Example for 250kbps @ 8MHz
-    // MCP_WriteByte(MCP_CNF1, 0x01); // SJW=1, BRP=1
-    // MCP_WriteByte(MCP_CNF2, 0x90); // BTLMODE=1, SAM=0, PHSEG1=2, PRSEG=0
+    if(clock_mhz != 8)
+        return; // only 8MHz supported here
+
+    switch(bitrate_kbps)
+    {
+        case 1000: // 1 Mbps @ 8MHz
+            MCP_WriteByte(MCP_CNF1, 0x00);
+            MCP_WriteByte(MCP_CNF2, 0x80 | (1<<3) | (0<<0)); // BTLMODE=1, PHSEG1=1, PRSEG=0
+            MCP_WriteByte(MCP_CNF3, 0x01); // PHSEG2=1
+            break;
+
+        case 500: // 500 kbps @ 8MHz
+            MCP_WriteByte(MCP_CNF1, 0x00);
+            MCP_WriteByte(MCP_CNF2, 0x90); 
+            MCP_WriteByte(MCP_CNF3, 0x02);
+            break;
+
+        case 250: // 250 kbps @ 8MHz
+            MCP_WriteByte(MCP_CNF1, 0x01);
+            MCP_WriteByte(MCP_CNF2, 0x90);
+            MCP_WriteByte(MCP_CNF3, 0x02);
+            break;
+
+        case 125: // 125 kbps @ 8MHz
+            MCP_WriteByte(MCP_CNF1, 0x03);
+            MCP_WriteByte(MCP_CNF2, 0x90);
+            MCP_WriteByte(MCP_CNF3, 0x02);
+            break;
+
+        default:
+            // Unsupported bitrate -> do nothing
+            break;
+    }
+}
     // MCP_WriteByte(MCP_CNF3, 0x02); // SOF=0, WAKFIL=0, PHSEG2=2
+
 }
