@@ -26,23 +26,23 @@
 #include <stdio.h>
 #include <math.h>
 #include <string.h>
+#include "mcp2515.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-
-typedef struct {
-	char IMU_data[30];
-	char Can_Message[30];
-	char pots[15];
-	char buttons[6];
-}can_Payload;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define NUM_ADC_CHANNELS 1
+
+// --- MPU6050 Health Check Defines ---
+#define MPU6050_I2C_ADDR (0x68 << 1) // MPU6050 7-bit address, left-shifted for HAL
+#define MPU6050_WHO_AM_I_REG 0x75    // WHO_AM_I register address
+#define MPU6050_WHO_AM_I_VAL 0x68    // Expected value from WHO_AM_I register
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -61,15 +61,17 @@ SPI_HandleTypeDef hspi1;
 /* USER CODE BEGIN PV */
 // HAL will populate this buffer with ADC results:
 uint16_t pot_value;
-can_Payload can;
+
 MPU6050_Data mpu_data;
-char IMU_data[20];
-char lcd_buffer[20];
+
 
 volatile uint8_t can_buttons[6] = {0, 0, 0, 0, 0, 0};
 // Variables for button de-bouncing
 #define DEBOUNCE_TIME_MS 200 // 200ms de-bounce delay
 static volatile uint32_t last_press_time[6] = {0};
+
+CAN_TxHeaderTypeDef can_tx_header;
+uint8_t can_tx_data[8]; //8-byte payload
 
 /* USER CODE END PV */
 
@@ -82,29 +84,55 @@ static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
 /* USER CODE BEGIN PFP */
 
-void Update_LCD(void) {
-    //lcd_put_cur(0, 0); sprintf(lcd_buffer, "P%.1f I%.1f D%.1f", pid.Kp, pid.Ki, pid.Kd); lcd_send_string(lcd_buffer);
-    //lcd_put_cur(1, 0); sprintf(lcd_buffer, "Angle:%-6.1f %s", current_angle, pid_enabled ? "ON " : "OFF"); lcd_send_string(lcd_buffer);
-}
-
 void IMU_Init(void){
 	MPU6050_Init(&hi2c1);
-	MPU6050_Read_All(&hi2c1, &mpu_data);
-	sprintf(IMU_data, "X:%0.1f Y:%0.1f Z:%0.1f", mpu_data.Ax, mpu_data.Ay, mpu_data.Az);
-	strcpy(lcd_buffer, IMU_data);
+
+	uint8_t who_am_i_val = 0;
+	HAL_StatusTypeDef ret = HAL_I2C_Mem_Read(&hi2c1, MPU6050_I2C_ADDR,
+											 MPU6050_WHO_AM_I_REG, 1,
+											 &who_am_i_val, 1, HAL_MAX_DELAY);
+	lcd_clear();
+	if (ret != HAL_OK)
+	{
+		// I2C communication failed (device did not ACK)
+		lcd_send_string("I2C Comm Failed");
+		while(1);
+	}
+
+	// 2. Check if the device is the correct one
+	if (who_am_i_val != MPU6050_WHO_AM_I_VAL)
+	{
+		// Got a response, but it's not the MPU6050
+		lcd_send_string("MPU6050 not found");
+		while(1);
+	}
+
+	lcd_send_string("MPU6050 OK");
+	HAL_Delay(1000);
+}
+
+void MCP_Init(void){
+
+	  // --- Initialize MCP2515 ---
+	  lcd_clear();
+	  //8MHz crystal on MCP2515 board and 500kbps bus speed
+	   if (MCP2515_Init(&hspi1, SPI_CS_GPIO_Port, SPI_CS_Pin, 8, 500) == MCP2515_OK)
+	   {
+	       lcd_put_cur(0, 0);
+	       lcd_send_string("MCP2515 OK      ");
+	   }
+	   else
+	   {
+	       lcd_put_cur(0, 0);
+	       lcd_send_string("MCP2515 FAIL    ");
+	       while (1); // Halt on error
+	   }
+	   HAL_Delay(1000);
+
 }
 
 void get_IMU(void){
 	MPU6050_Read_All(&hi2c1, &mpu_data);
-		sprintf(IMU_data, "X:%0.1f Y:%0.1f Z:%0.1f", mpu_data.Ax, mpu_data.Ay, mpu_data.Az);
-		strcpy(can.IMU_data, IMU_data);
-}
-
-void get_POT(void){
-
-	uint8_t maped_value = ((int32_t)pot_value * 100) / 4095;
-	sprintf(can.pots, "POT:%d", maped_value);
-
 }
 
 /* USER CODE END PFP */
@@ -156,8 +184,8 @@ int main(void)
   lcd_send_string("Initializing...");
 
   IMU_Init();
-  lcd_put_cur(1,0);
-  lcd_send_string(lcd_buffer);
+
+  MCP_Init();
 
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)&pot_value, NUM_ADC_CHANNELS);
 
@@ -168,26 +196,72 @@ int main(void)
   lcd_clear();
   while (1)
   {
-	  sprintf(can.buttons, "%d%d%d%d%d%d",
-	          can_buttons[0],
-	          can_buttons[1],
-	          can_buttons[2],
-	          can_buttons[3],
-	          can_buttons[4],
-	          can_buttons[5]);
+	  // --- 1. Get All Sensor Data ---
+	        get_IMU(); // Updates global 'mpu_data'
+	                   // Button states are updated by EXTI callback in 'can_buttons'
 
-	  get_POT();
-	  lcd_put_cur(0,0);
-	  sprintf(can.Can_Message, "%s %s", can.pots, can.buttons);
-	  lcd_send_string(can.Can_Message);
+	        // --- 2. Prepare and Send POT/Button Packet (CAN ID 0x100) ---
 
-	  get_IMU();
-	  lcd_put_cur(1,0);
-	  lcd_send_string(can.IMU_data);
+	        // Map pot to 0-100, then scale to 0-255 for one byte
+	        uint8_t mapped_pot = ((int32_t)pot_value * 255) / 4095;
 
-	  //lcd_put_cur(0,0);
-	  //lcd_send_string(can.buttons);
-	  HAL_Delay(10);
+	        // Pack 6 buttons into one byte (Bit 0 = Btn 0, Bit 1 = Btn 1, etc.)
+	        uint8_t button_byte = 0;
+	        for (int i = 0; i < 6; i++)
+	        {
+	            if (can_buttons[i])
+	            {
+	                button_byte |= (1 << i);
+	            }
+	        }
+
+	        can_tx_header.StdId = 0x100;     // Standard CAN ID
+	        can_tx_header.IDE = CAN_ID_STD;  // Standard ID type
+	        can_tx_header.RTR = CAN_RTR_DATA;// Data frame
+	        can_tx_header.DLC = 2;           // 2 bytes of data
+	        can_tx_data[0] = mapped_pot;     // Data byte 0
+	        can_tx_data[1] = button_byte;    // Data byte 1
+
+	        MCP2515_SendMessage(&can_tx_header, can_tx_data);
+
+	        HAL_Delay(10); // Short delay between packets
+
+	        // --- 3. Prepare and Send IMU Accel Packet (CAN ID 0x101) ---
+
+	        // Convert floats to int16_t (multiplied by 100 for 2 decimal places)
+	        // e.g., 1.23g becomes 123
+	        int16_t ax = (int16_t)(mpu_data.Ax * 100.0f);
+	        int16_t ay = (int16_t)(mpu_data.Ay * 100.0f);
+	        int16_t az = (int16_t)(mpu_data.Az * 100.0f);
+
+	        can_tx_header.StdId = 0x101;
+	        can_tx_header.DLC = 6; // 6 bytes (2 bytes per axis)
+
+	        // Pack int16_t into two uint8_t (Big-Endian)
+	        can_tx_data[0] = (ax >> 8) & 0xFF;   // Accel X High Byte
+	        can_tx_data[1] = ax & 0xFF;         // Accel X Low Byte
+	        can_tx_data[2] = (ay >> 8) & 0xFF;   // Accel Y High Byte
+	        can_tx_data[3] = ay & 0xFF;         // Accel Y Low Byte
+	        can_tx_data[4] = (az >> 8) & 0xFF;   // Accel Z High Byte
+	        can_tx_data[5] = az & 0xFF;         // Accel Z Low Byte
+
+	        MCP2515_SendMessage(&can_tx_header, can_tx_data);
+
+
+	        // --- 4. Update LCD Display ---
+	        char lcd_buf_row0[20];
+	        char lcd_buf_row1[20];
+
+	        // We can use the string buffers for the LCD
+	        sprintf(lcd_buf_row0, "P:%-3d B:%02X", mapped_pot, button_byte);
+	        sprintf(lcd_buf_row1, "X:%.1f Y:%.1f Z:%0.1f", mpu_data.Ax, mpu_data.Ay, mpu_data.Az);
+
+	        lcd_put_cur(0, 0);
+	        lcd_send_string(lcd_buf_row0);
+	        lcd_put_cur(1, 0);
+	        lcd_send_string(lcd_buf_row1);
+
+	        HAL_Delay(90); // Total loop time will be ~100ms
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -401,6 +475,9 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(LED_2_GPIO_Port, LED_2_Pin, GPIO_PIN_RESET);
 
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SPI_CS_GPIO_Port, SPI_CS_Pin, GPIO_PIN_RESET);
+
   /*Configure GPIO pin : LED_1_Pin */
   GPIO_InitStruct.Pin = LED_1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
@@ -416,8 +493,9 @@ static void MX_GPIO_Init(void)
 
   /*Configure GPIO pin : SPI_CS_Pin */
   GPIO_InitStruct.Pin = SPI_CS_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(SPI_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB0 PB1 PB10 PB3
