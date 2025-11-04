@@ -1,8 +1,8 @@
-import customtkinter as ctk
 import tkinter as tk
+import customtkinter as ctk
 import math
-import random
-from PIL import Image, ImageTk # For more advanced image handling if needed
+import random  # No longer used for sim, but kept for now
+from PIL import Image, ImageTk
 from datetime import datetime
 
 # --- IMPORT: Add imports for networking and threading ---
@@ -12,10 +12,14 @@ import queue
 import time
 
 # --- Configuration ---
-# *** UDP Configuration is now active ***
-UDP_IP = "127.0.0.1"
-UDP_PORT = 5005
-PACKET_FORMAT = "roll,pitch,z_accel,throttle,b1,b2,b3,b4,b5,b6"
+# *** NEW: UDP Configuration based on your Lua script ***
+ESP_IP = "10.232.11.234"  # The ESP32's IP address
+LOCAL_IP = "10.232.11.65"
+UDP_PORT = 8888          # Port to listen on (matches Lua)
+
+# --- Network Config from Code 1 ---
+PING_INTERVAL_S = 1.0        # how often we ping when "not connected"
+DISCONNECT_S    = 10.0       # consider link down if no packet for this many seconds
 
 # --- Appearance Settings ---
 BG_COLOR = "#222222" # Darker background
@@ -27,7 +31,6 @@ CRITICAL_COLOR = "#ff0000" # Red for critical
 TEXT_COLOR_PRIMARY = "#e0e0e0" # Light grey
 TEXT_COLOR_HIGHLIGHT = "#00ffff" # Cyan for primary readouts
 
-# *** FIX: Added explicit hover colors to avoid alpha channel errors ***
 ACCENT_COLOR_HOVER = "#5a5a5a"
 ACTIVE_COLOR_HOVER = "#00cc00"
 
@@ -41,12 +44,105 @@ SWITCH_FONT = (FONT_FAMILY, 10, "bold") # Font for the "ON"/"OFF" part
 CONSOLE_FONT = ("Courier New", 12, "bold")
 CONSOLE_TEXT_COLOR = "#00ff00" # Bright green
 CONSOLE_BG_COLOR = "#000000" # Pure black
-CONSOLE_PROMPT = "RECV> "
+CONSOLE_PROMPT = "SYS> " # Changed prompt
 
 BUTTON_NAMES = [
-    "LANDING GEAR", "AUTOPILOT", "FLAPS UP/DN",
+    "BLINK LEFT", "BLINK RIGHT", "FLAPS UP/DN",
     "NAV LIGHTS", "STALL WARN", "ENGINE START"
 ]
+
+# =============================
+# Network client (from Code 1)
+# =============================
+class UdpClient:
+    def __init__(self, app):
+        self.app = app
+        self.running = True
+        self.sock = None
+        self.lock = threading.Lock()
+        self.last_rx = 0.0
+        self.latency_ms = 0.0
+        self.connected_once = False
+
+    def start(self):
+        # Create ONE socket bound to LOCAL_IP:UDP_PORT and reuse for send/recv
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(0.5)
+        try:
+            self.sock.bind((LOCAL_IP, UDP_PORT))
+            self.app.post_console(f"UDP bound on {LOCAL_IP}:{UDP_PORT}")
+        except Exception as e:
+            self.app.post_console(f"!!! FAILED to bind socket: {e}")
+            self.app.post_console(f"Check LOCAL_IP and ensure no other app is using port {UDP_PORT}")
+            return
+
+        # Threads
+        threading.Thread(target=self.recv_loop, daemon=True).start()
+        threading.Thread(target=self.ping_loop, daemon=True).start()
+
+    def stop(self):
+        self.running = False
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+
+    def ping_loop(self):
+        while self.running:
+            # Ping only if we have never connected or we consider the link down
+            link_down = (time.time() - self.last_rx) > PING_INTERVAL_S if self.last_rx else True
+            if link_down:
+                try:
+                    t0 = time.time()
+                    with self.lock:
+                        if self.sock: # Check if socket exists before using
+                            self.sock.sendto(b"PING", (ESP_IP, UDP_PORT))
+                    self.app.mark_ping_sent()
+                    # latency measured on first reply to anything after this ping (see recv)
+                    self._last_ping_at = t0
+                except Exception as e:
+                    if self.running: # Only show error if we are not stopping
+                        self.app.post_console(f"Ping error: {e}")
+            time.sleep(PING_INTERVAL_S)
+
+    def recv_loop(self):
+        while self.running:
+            try:
+                data, addr = self.sock.recvfrom(2048)
+            except socket.timeout:
+                continue
+            except OSError:
+                if self.running:
+                    self.app.post_console("Socket closed.")
+                break # Socket was closed, exit loop
+            except Exception as e:
+                if self.running:
+                    self.app.post_console(f"Recv error: {e}")
+                continue
+
+            now = time.time()
+            self.last_rx = now
+            
+            try:
+                text_block = data.decode(errors='ignore')
+            except Exception as e:
+                self.app.post_console(f"Decode error: {e}")
+                continue
+
+            # Measure one-way latency versus last ping (best-effort)
+            t0 = getattr(self, "_last_ping_at", None)
+            if t0:
+                self.latency_ms = max(0.0, (now - t0) * 1000.0)
+                self._last_ping_at = None # Consume the ping time
+
+            lines = text_block.strip().split('\n')
+            for s in lines:
+                s_stripped = s.strip()
+                if s_stripped:
+                    # Any packet proves life; some may be control/hello strings
+                    self.app.on_packet(s_stripped, addr)
+
 
 # --- Custom ToggleSwitch Widget ---
 class ToggleSwitch(ctk.CTkFrame):
@@ -69,7 +165,6 @@ class ToggleSwitch(ctk.CTkFrame):
                                     corner_radius=5, 
                                     height=25,
                                     fg_color=ACCENT_COLOR, 
-                                    # *** FIX: Use explicit hover color constant ***
                                     hover_color=ACCENT_COLOR_HOVER,
                                     text_color=TEXT_COLOR_PRIMARY,
                                     command=self._toggle)
@@ -88,13 +183,11 @@ class ToggleSwitch(ctk.CTkFrame):
         if is_on:
             self.switch.configure(text="ON", 
                                   fg_color=ACTIVE_COLOR, 
-                                  # *** FIX: Use explicit hover color constant ***
                                   hover_color=ACTIVE_COLOR_HOVER,
                                   text_color=BG_COLOR)
         else:
             self.switch.configure(text="OFF", 
                                   fg_color=ACCENT_COLOR, 
-                                  # *** FIX: Use explicit hover color constant ***
                                   hover_color=ACCENT_COLOR_HOVER,
                                   text_color=TEXT_COLOR_PRIMARY)
 
@@ -104,7 +197,7 @@ class FlightCockpitApp(ctk.CTk):
         super().__init__()
 
         # --- Window Setup ---
-        self.title("Advanced Flight Control Cockpit (UDP LOOPBACK)")
+        self.title("Advanced Flight Control Cockpit (ESP32 UDP Client)")
         self.geometry("1540x920") # Fixed window size
         self.resizable(False, False) 
         ctk.set_appearance_mode("dark")
@@ -127,39 +220,21 @@ class FlightCockpitApp(ctk.CTk):
         self.heading = ctk.DoubleVar(value=0.0) # degrees 0-360
         self.vertical_speed = ctk.DoubleVar(value=0.0) # ft/min
 
-        # --- Simulation State Variables (for sender thread) ---
-        self.sim_roll = 0.0
-        self.sim_pitch = 0.0
-        self.sim_throttle = 50.0
-        self.sim_airspeed = 100.0
-        self.sim_altitude = 5000.0
-        self.sim_heading = 0.0
-        self.sim_vertical_speed = 0.0 # ft/min
-        self.sim_buttons = [False] * 6
-
         # --- Threading & UDP Setup ---
         self.running = True # Flag to control threads
-        self.udp_queue = queue.Queue() # Queue for thread-safe GUI updates
-        self.last_packet_time = time.time()
-
+        self.net = UdpClient(self) # <-- This is the UdpClient from Code 1
+        
         # Create UI Elements
         self.create_main_layout()
 
         # --- Start Threads and Polling Loops ---
-        
-        # Start the UDP receiver thread
-        self.receiver_thread = threading.Thread(target=self.udp_receiver_thread, daemon=True)
-        self.receiver_thread.start()
-        
-        # Start the UDP simulator (sender) thread
-        self.simulator_thread = threading.Thread(target=self.udp_simulator_thread, daemon=True)
-        self.simulator_thread.start()
-
-        # Start the main GUI poller for the queue
-        self.after(50, self.check_udp_queue)
+        self.net.start() # <-- This starts the recv_loop and ping_loop
         
         # Start the 1-second-timer for the flight clock
         self.after(1000, self.update_flight_time)
+
+        # Start the main GUI update/disconnect loop
+        self.after(100, self.animate_loop) 
 
         # Handle window closing
         self.protocol("WM_DELETE_WINDOW", self.on_closing)
@@ -167,8 +242,24 @@ class FlightCockpitApp(ctk.CTk):
     def on_closing(self):
         """Handle window close event to shut down threads."""
         self.running = False
+        self.net.stop() # Stop the network threads
         time.sleep(0.1) # Give threads a moment to stop
         self.destroy()
+        
+    def post_console(self, message: str):
+        """Thread-safe way to add a message to the console."""
+        def _do_post():
+            try:
+                self.console_textbox.configure(state="normal")
+                now = datetime.now()
+                time_stamp = now.strftime("%H:%M:%S")
+                self.console_textbox.insert("end", f"{CONSOLE_PROMPT}[{time_stamp}] {message}\n")
+                self.console_textbox.see("end")
+                self.console_textbox.configure(state="disabled")
+            except tk.TclError:
+                # Handle error if widget is destroyed
+                pass
+        self.after(0, _do_post)
 
     # --- UI Creation Methods ---
     def create_main_layout(self):
@@ -185,7 +276,6 @@ class FlightCockpitApp(ctk.CTk):
         self.create_vertical_throttle_panel(top_frame) # Vertical throttle on the right
 
         # Bottom panel for buttons and other info
-        # *** FIX: Adjust height for layout ***
         bottom_frame = ctk.CTkFrame(self, fg_color=BG_COLOR, height=140)
         bottom_frame.grid(row=1, column=0, padx=10, pady=(0,10), sticky="ew") 
         bottom_frame.grid_columnconfigure(0, weight=0) 
@@ -199,7 +289,6 @@ class FlightCockpitApp(ctk.CTk):
 
     def create_pfd_frame(self, parent_frame):
         """Main frame for the Primary Flight Display."""
-        # *** FIX: Adjust height for layout ***
         pfd_frame = ctk.CTkFrame(parent_frame, fg_color=PANEL_COLOR, 
                                  border_width=2, border_color=ACCENT_COLOR, corner_radius=10,
                                  width=1130, height=580)
@@ -220,7 +309,6 @@ class FlightCockpitApp(ctk.CTk):
         self.create_vertical_speed_indicator(pfd_frame) 
 
     def create_vertical_throttle_panel(self, parent_frame):
-        # *** FIX: Adjust height for layout ***
         frame = ctk.CTkFrame(parent_frame, fg_color=PANEL_COLOR, 
                              border_width=2, border_color=ACCENT_COLOR, corner_radius=10,
                              width=150, height=580)
@@ -245,7 +333,6 @@ class FlightCockpitApp(ctk.CTk):
 
     def create_comm_panel(self, parent_frame):
         """Creates a new panel for communication/debug status."""
-        # *** FIX: Adjust height for layout ***
         frame = ctk.CTkFrame(parent_frame, fg_color=PANEL_COLOR, 
                              border_width=2, border_color=ACCENT_COLOR, corner_radius=10,
                              width=200, height=580)
@@ -260,7 +347,7 @@ class FlightCockpitApp(ctk.CTk):
         udp_title = ctk.CTkLabel(frame, text="UDP Status:", font=SMALL_FONT, text_color=TEXT_COLOR_PRIMARY)
         udp_title.grid(row=1, column=0, padx=10, pady=(10, 0), sticky="w")
         
-        self.udp_status_label = ctk.CTkLabel(frame, text="LISTENING...", font=MEDIUM_FONT, text_color=WARNING_COLOR)
+        self.udp_status_label = ctk.CTkLabel(frame, text="Initializing...", font=MEDIUM_FONT, text_color=WARNING_COLOR)
         self.udp_status_label.grid(row=2, column=0, padx=10, pady=5, sticky="w")
         
         last_packet_title = ctk.CTkLabel(frame, text="Last Packet:", font=SMALL_FONT, text_color=TEXT_COLOR_PRIMARY)
@@ -303,14 +390,12 @@ class FlightCockpitApp(ctk.CTk):
 
         self.pitch_ladder_lines = []
         self.pitch_ladder_texts = []
-        # self.pitch_ladder_bgs = [] # No longer needed
         self.roll_indicator_lines = []
         self.roll_indicator_texts = []
         self.roll_indicator_static_arc = None
         self.roll_indicator_static_pointer = None
         self.static_plane_symbol = None
         
-        # *** FIX: Initialize roll_pointer to None to prevent race condition ***
         self.roll_pointer = None
         
         self.horizon_canvas.bind("<Configure>", self.on_horizon_canvas_resize)
@@ -350,7 +435,7 @@ class FlightCockpitApp(ctk.CTk):
             
             if angle == 0:
                  self.roll_indicator_static_pointer = c.create_polygon(
-                     w/2, 20, w/2-10, 30, w/2+10, 30, fill="yellow", outline=""
+                      w/2, 20, w/2-10, 30, w/2+10, 30, fill="yellow", outline=""
                  ) 
             
             if angle in [-30, 30]:
@@ -460,7 +545,7 @@ class FlightCockpitApp(ctk.CTk):
         c.create_rectangle(center_x - box_width/2, h - box_height, center_x + box_width/2, h,
                            fill="#333333", outline="white", width=1)
         self.vsi_readout_text = c.create_text(center_x, h - box_height/2, text="+000",
-                                               fill="lime", font=(FONT_FAMILY, 10, "bold"))
+                                              fill="lime", font=(FONT_FAMILY, 10, "bold"))
 
 
     def create_heading_indicator(self, parent_frame):
@@ -482,7 +567,6 @@ class FlightCockpitApp(ctk.CTk):
         self.heading_canvas.bind("<Configure>", self.on_heading_indicator_resize)
 
     def create_button_panel(self, parent_frame):
-        # *** FIX: Adjust height for layout ***
         frame = ctk.CTkFrame(parent_frame, fg_color=PANEL_COLOR, 
                              border_width=2, border_color=ACCENT_COLOR, corner_radius=10,
                              width=900, height=140)
@@ -522,7 +606,6 @@ class FlightCockpitApp(ctk.CTk):
 
 
     def create_bottom_info_panel(self, parent_frame):
-        # *** FIX: Adjust height for layout ***
         frame = ctk.CTkFrame(parent_frame, fg_color=PANEL_COLOR, 
                              border_width=2, border_color=ACCENT_COLOR, corner_radius=10,
                              width=580, height=140)
@@ -554,9 +637,8 @@ class FlightCockpitApp(ctk.CTk):
 
     def create_console_frame(self):
         """Creates the debug console frame at the bottom of the window."""
-        # *** STYLE: Apply retro styling ***
         console_frame = ctk.CTkFrame(self, fg_color="#1a1a1a", 
-                                     border_width=2, border_color="#666666", corner_radius=0, # Square corners
+                                     border_width=2, border_color="#666666", corner_radius=0, 
                                      height=115)
         console_frame.grid(row=2, column=0, sticky="ew", padx=10, pady=(0,10))
         console_frame.grid_propagate(False)
@@ -565,7 +647,6 @@ class FlightCockpitApp(ctk.CTk):
         console_frame.grid_rowconfigure(0, weight=1)
         
         self.console_textbox = ctk.CTkTextbox(console_frame, 
-                                              # *** STYLE: Apply geeky font and colors ***
                                               font=CONSOLE_FONT, 
                                               text_color=CONSOLE_TEXT_COLOR,
                                               fg_color=CONSOLE_BG_COLOR,
@@ -574,168 +655,116 @@ class FlightCockpitApp(ctk.CTk):
         self.console_textbox.insert("end", "Debug Console Initialized...\n")
         self.console_textbox.configure(state="disabled")
 
-    # --- Threading, UDP and GUI Update Loop ---
+    # --- NEW: Callbacks for UdpClient ---
 
-    def udp_receiver_thread(self):
-        """
-        Runs in a separate thread, listens for UDP packets,
-        and puts them in the queue.
-        """
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(1.0) # 1 second timeout
-        try:
-            sock.bind((UDP_IP, UDP_PORT))
-            print(f"UDP Receiver listening on {UDP_IP}:{UDP_PORT}")
-        except OSError as e:
-            print(f"!!! UDP BIND FAILED: {e}")
-            print("!!! Is another instance running? Exiting thread.")
-            return
-
-        while self.running:
+    def mark_ping_sent(self):
+        # This can be called from a thread, so schedule it
+        def _do_mark():
             try:
-                data, addr = sock.recvfrom(1024) # buffer size is 1024 bytes
-                raw_packet = data.decode()
-                self.udp_queue.put(raw_packet)
-            except socket.timeout:
-                continue # Just loop again if no packet in 1s
+                # Only show pinging status if we are not connected
+                now = time.time()
+                if self.net.last_rx == 0 or (now - self.net.last_rx) > DISCONNECT_S:
+                    self.udp_status_label.configure(text=f"Pinging {ESP_IP}...", text_color=WARNING_COLOR)
+                    self.post_console(f"Sent PING to {ESP_IP}")
+            except Exception:
+                pass # App may be closing
+        self.after(0, _do_mark)
+
+    def on_packet(self, text: str, addr):
+        # This is called from the network thread, so schedule UI updates
+        def _do_update():
+            try:
+                # === PACKET RECEIVED! ===
+                if not self.net.connected_once:
+                    self.post_console(f"Connection established with {addr[0]}")
+                    self.net.connected_once = True # Mark that we've connected at least once
+                
+                self.udp_status_label.configure(text=f"Connected to ESP32", text_color=ACTIVE_COLOR)
+                # self.last_packet_label.configure(text="< 1s ago", text_color=TEXT_COLOR_PRIMARY) # This is handled by animate_loop
+                self.post_console(f"RECV from {addr[0]}: {text}")
+
+                # --- Key-Value Parser ---
+                parts = {}
+                try:
+                    for item in text.split(','):
+                        kv = item.split('=')
+                        if len(kv) == 2:
+                            parts[kv[0].strip()] = kv[1].strip()
+                except Exception as e:
+                    self.post_console(f"Packet parse error: {e}")
+                    return
+
+                if not parts: # e.g. just a "PING" reply
+                    return
+
+                # --- Map Lua-style keys to Python GUI variables ---
+                self.airspeed.set(float(parts.get("SPEED", self.airspeed.get())))
+                self.throttle.set(float(parts.get("THROTTLE", self.throttle.get()*100)) / 100.0)
+                self.roll.set(float(parts.get("ROLL", self.roll.get())))
+                self.pitch.set(float(parts.get("PITCH", self.pitch.get())))
+                self.altitude.set(float(parts.get("ALT", self.altitude.get())))
+                self.heading.set(float(parts.get("HDG", self.heading.get())))
+                self.vertical_speed.set(float(parts.get("VSI", self.vertical_speed.get())))
+
+                self.z_accel.set(float(parts.get("Z_ACCEL", self.z_accel.get())))
+
+                blink_str = parts.get("BLINK", "OFF")
+                self.buttons[0].set(blink_str == "LEFT")
+                self.buttons[1].set(blink_str == "RIGHT")
+                self.buttons[2].set(parts.get("FLAPS", "false") == "true")
+                self.buttons[3].set(parts.get("NAV_LIGHT", "false") == "true")
+                self.buttons[4].set(parts.get("STALL_WRN", "false") == "true")
+                self.buttons[5].set(parts.get("ENG_STRT", "false") == "true")
+                
+                # --- Update All GUI Elements ---
+                self.update_gui_elements()
+
             except Exception as e:
-                if self.running:
-                    print(f"Receiver error: {e}")
-        sock.close()
-        print("UDP Receiver thread stopped.")
+                self.post_console(f"On-packet update error: {e}")
 
-    def udp_simulator_thread(self):
-        """
-        Runs in a separate thread, generates fake data,
-        and sends it to the receiver.
-        """
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        print(f"UDP Simulator sending to {UDP_IP}:{UDP_PORT}")
+        self.after(0, _do_update)
+
+    def reset_all_data(self):
+        """Sets all GUI data to a safe, zeroed state."""
+        self.pitch.set(0.0)
+        self.roll.set(0.0)
+        self.z_accel.set(0.0)
+        self.throttle.set(0.0)
+        self.airspeed.set(0.0)
+        self.altitude.set(0.0)
+        self.heading.set(0.0)
+        self.vertical_speed.set(0.0)
+        for i in range(6):
+            self.buttons[i].set(False)
         
-        while self.running:
-            # --- Generate Simulated Data ---
-            self.sim_roll += random.uniform(-1.5, 1.5)
-            self.sim_pitch += random.uniform(-1.0, 1.0)
-            self.sim_roll = max(-45.0, min(45.0, self.sim_roll))
-            self.sim_pitch = max(-25.0, min(25.0, self.sim_pitch))
-            
-            sim_z_accel = 1.0 + random.uniform(-0.05, 0.05)
-            
-            self.sim_throttle += random.uniform(-2.0, 2.0)
-            self.sim_throttle = max(0.0, min(100.0, self.sim_throttle))
-            
-            self.sim_airspeed += (self.sim_throttle / 20 - 5) + random.uniform(-1.0, 1.0)
-            self.sim_airspeed = max(0.0, min(300.0, self.sim_airspeed))
-            
-            self.sim_vertical_speed = (self.sim_pitch * 100) + (self.sim_throttle * 5) - 250 
-            self.sim_vertical_speed = max(-6000, min(6000, self.sim_vertical_speed)) 
-            
-            self.sim_altitude += self.sim_vertical_speed * (0.05 / 60) 
-            self.sim_altitude = max(0.0, min(20000.0, self.sim_altitude)) 
-            
-            self.sim_heading += random.uniform(-0.5, 0.5)
-            self.sim_heading = (self.sim_heading + 360) % 360 
-            
-            for i in range(6):
-                if random.random() < 0.01:
-                    self.sim_buttons[i] = not self.sim_buttons[i]
+        # Force GUI to redraw with the new zeroed values
+        self.update_gui_elements()
 
-            # --- Format and Send Packet ---
-            # Format: "roll,pitch,z_accel,throttle,b1,b2,b3,b4,b5,b6"
-            packet_data = (
-                f"{self.sim_roll:.2f},"
-                f"{self.sim_pitch:.2f},"
-                f"{sim_z_accel:.2f},"
-                f"{self.sim_throttle:.1f}," # Send as 0-100
-                f"{self.sim_buttons[0]},"
-                f"{self.sim_buttons[1]},"
-                f"{self.sim_buttons[2]},"
-                f"{self.sim_buttons[3]},"
-                f"{self.sim_buttons[4]},"
-                f"{self.sim_buttons[5]}"
-            )
-            
-            # Add sim data for PFD tapes (which are not in the packet)
-            # This is a bit of a cheat for the loopback, but makes it work
-            # In a real system, the receiver would not have this data.
-            packet_data += (
-                f",{self.sim_airspeed:.2f}"
-                f",{self.sim_altitude:.2f}"
-                f",{self.sim_heading:.2f}"
-                f",{self.sim_vertical_speed:.2f}"
-            )
-            
-            sock.sendto(packet_data.encode(), (UDP_IP, UDP_PORT))
-            
-            time.sleep(0.05) # ~20 Hz update rate
+    def animate_loop(self):
+        """ Main loop for checking connection status. """
+        now = time.time()
         
-        sock.close()
-        print("UDP Simulator thread stopped.")
+        # --- CHECK FOR DISCONNECTION ---
+        if self.net.last_rx != 0 and (now - self.net.last_rx) > DISCONNECT_S:
+            self.udp_status_label.configure(text="Connection lost. Reconnecting...", text_color=CRITICAL_COLOR)
+            self.last_packet_label.configure(text=f"> {DISCONNECT_S:.0f}s ago", text_color=CRITICAL_COLOR)
+            self.post_console("Connection lost. Reconnecting...")
+            
+            # Reset all data to a safe "off" state
+            self.reset_all_data() 
 
-    def check_udp_queue(self):
-        """
-        Polls the queue from the main thread and updates the GUI.
-        This is the only thread-safe way to update tkinter.
-        """
-        try:
-            while not self.udp_queue.empty():
-                raw_packet = self.udp_queue.get_nowait()
-                
-                # --- Parse Packet ---
-                parts = raw_packet.split(',')
-                if len(parts) >= 10: # Check for minimum length
-                    # This is where you parse the *real* packet
-                    self.roll.set(float(parts[0]))
-                    self.pitch.set(float(parts[1]))
-                    self.z_accel.set(float(parts[2]))
-                    self.throttle.set(float(parts[3]) / 100.0) # Convert 0-100 to 0.0-1.0
-                    
-                    # Parse boolean strings
-                    self.buttons[0].set(parts[4] == "True")
-                    self.buttons[1].set(parts[5] == "True")
-                    self.buttons[2].set(parts[6] == "True")
-                    self.buttons[3].set(parts[7] == "True")
-                    self.buttons[4].set(parts[8] == "True")
-                    self.buttons[5].set(parts[9] == "True")
-                    
-                    # Update PFD variables from our "cheated" extra data
-                    if len(parts) >= 14:
-                        self.airspeed.set(float(parts[10]))
-                        self.altitude.set(float(parts[11]))
-                        self.heading.set(float(parts[12]))
-                        self.vertical_speed.set(float(parts[13]))
-
-                    # --- Update Comm Status Panel ---
-                    self.udp_status_label.configure(text="CONNECTED", text_color=ACTIVE_COLOR)
-                    self.last_packet_label.configure(text="< 1s ago", text_color=TEXT_COLOR_PRIMARY)
-                    self.last_packet_time = time.time()
-                    
-                    now=datetime.now()
-                    time_stamp = now.strftime("%H:%M:%S")
-                    # --- Update Console ---
-                    self.console_textbox.configure(state="normal")
-                    # *** STYLE: Apply retro prompt ***
-                    self.console_textbox.insert("end", f"{CONSOLE_PROMPT}[{time_stamp}] {raw_packet}\n")
-                    self.console_textbox.see("end")
-                    self.console_textbox.configure(state="disabled")
-
-                    # --- Update All GUI Elements ---
-                    self.update_gui_elements()
-                
-                else:
-                    print(f"Malformed packet received: {raw_packet}")
-
-        except queue.Empty:
-            pass # No new data
+            # Force UdpClient to reset its "last_rx"
+            self.net.last_rx = 0.0
+            self.net.connected_once = False # Allow "Connection established" to show again
+            
+        elif self.net.last_rx != 0:
+            # We are connected, update packet age
+            age = now - self.net.last_rx
+            self.last_packet_label.configure(text=f"{age:.1f}s ago", text_color=TEXT_COLOR_PRIMARY)
         
-        # Check for timeout
-        if (time.time() - self.last_packet_time) > 2.0:
-            self.udp_status_label.configure(text="DISCONNECTED", text_color=CRITICAL_COLOR)
-            self.last_packet_label.configure(text="> 2s ago", text_color=WARNING_COLOR)
-
-        # Reschedule the checker
+        # Reschedule the loop
         if self.running:
-            self.after(50, self.check_udp_queue) # Check again in 50ms
+            self.after(100, self.animate_loop) # Run ~10 FPS
 
     def update_flight_time(self):
         """Updates the flight time label every second."""
@@ -788,7 +817,9 @@ class FlightCockpitApp(ctk.CTk):
         elif self.buttons[4].get(): # Stall warning button active
             self.status_display.configure(text="STALL WARNING", text_color=CRITICAL_COLOR)
         elif self.altitude.get() < 100 and not self.buttons[0].get(): # Landing gear
-            self.status_display.configure(text="GEAR UP LOW ALT", text_color=WARNING_COLOR)
+            # This logic is now broken, button 0 is "BLINK LEFT"
+            # self.status_display.configure(text="GEAR UP LOW ALT", text_color=WARNING_COLOR)
+            self.status_display.configure(text="NORMAL", text_color=ACTIVE_COLOR)
         else:
             self.status_display.configure(text="NORMAL", text_color=ACTIVE_COLOR)
 
@@ -806,7 +837,6 @@ class FlightCockpitApp(ctk.CTk):
         
         self.pitch_ladder_lines = []
         self.pitch_ladder_texts = []
-        # self.pitch_ladder_bgs = [] # REMOVED
 
         c = self.horizon_canvas
         w = c.winfo_width()
@@ -834,7 +864,6 @@ class FlightCockpitApp(ctk.CTk):
 
     def update_horizon(self):
         """ The core logic to redraw the attitude indicator """
-        # *** FIX: Add check to prevent error before canvas is ready ***
         if self.roll_pointer is None:
             return 
             
@@ -964,7 +993,7 @@ class FlightCockpitApp(ctk.CTk):
         c.create_rectangle(10, tape_center_y - box_height/2, 10 + box_width, tape_center_y + box_height/2,
                            fill="#333333", outline="white", width=1)
         self.airspeed_readout_text = c.create_text(10 + box_width/2, tape_center_y, text="0",
-                                            fill="lime", font=(FONT_FAMILY, 20, "bold"))
+                                                   fill="lime", font=(FONT_FAMILY, 20, "bold"))
         
         c.create_polygon(w, tape_center_y, w - 15, tape_center_y - 8, w - 15, tape_center_y + 8,
                          fill="yellow", outline="")
@@ -1027,7 +1056,7 @@ class FlightCockpitApp(ctk.CTk):
         c.create_rectangle(10, tape_center_y - box_height/2, 10 + box_width, tape_center_y + box_height/2,
                            fill="#333333", outline="white", width=1)
         self.altitude_readout_text = c.create_text(10 + box_width/2, tape_center_y, text="0",
-                                            fill="lime", font=(FONT_FAMILY, 20, "bold"))
+                                                   fill="lime", font=(FONT_FAMILY, 20, "bold"))
         
         c.create_polygon(0, tape_center_y, 15, tape_center_y - 8, 15, tape_center_y + 8,
                          fill="yellow", outline="")
@@ -1063,8 +1092,8 @@ class FlightCockpitApp(ctk.CTk):
                     c.coords(text_id, 10 + 25, y_on_canvas)
                     c.itemconfigure(text_id, state='normal')
                 elif alt_val % 500 == 0: 
-                     c.coords(line_id, 10, y_on_canvas, 10 + 15, y_on_canvas)
-                     c.itemconfigure(line_id, width=1)
+                    c.coords(line_id, 10, y_on_canvas, 10 + 15, y_on_canvas)
+                    c.itemconfigure(line_id, width=1)
                 else: 
                     c.coords(line_id, 10, y_on_canvas, 10 + 10, y_on_canvas)
                     c.itemconfigure(line_id, width=1)
@@ -1108,11 +1137,11 @@ class FlightCockpitApp(ctk.CTk):
         self.heading_static_box = c.create_rectangle(center_x - box_width/2, 0, center_x + box_width/2, box_height,
                            fill="#333333", outline="white", width=1)
         self.heading_readout_text = c.create_text(center_x, box_height/2, text="0°",
-                      fill="lime", font=(FONT_FAMILY, 16, "bold"))
+                                fill="lime", font=(FONT_FAMILY, 16, "bold"))
         
         self.heading_static_pointer = c.create_polygon(center_x, box_height, center_x - 8, box_height + 10, center_x + 8, box_height + 10,
-                         fill="yellow", outline="")
-                         
+                                     fill="yellow", outline="")
+                                     
         for deg in range(-360, 360*2, 5): 
             line_id = c.create_line(0,0,0,0, fill="white")
             text_id = None
