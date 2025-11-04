@@ -263,4 +263,3 @@ static void MCP_SetBitrate(uint8_t clock_mhz, uint16_t bitrate_kbps)
 }
     // MCP_WriteByte(MCP_CNF3, 0x02); // SOF=0, WAKFIL=0, PHSEG2=2
 
-}
