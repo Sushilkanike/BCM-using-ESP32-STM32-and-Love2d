@@ -32,7 +32,7 @@
 /* FreeRTOS Includes */
 #include "FreeRTOS.h"
 #include "task.h"
-#include "semphr.h" // For Mutexes
+#include "semphr.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -115,7 +115,8 @@ void vReadLocalSensorsTask(void *pvParameters);
 void vUpdateLcdTask(void *pvParameters);
 void vSendCanTask(void *pvParameters);
 
-// --- Hardware Init Functions (unchanged from original) ---
+// --- Hardware Init Functions ---
+
 void IMU_Init(void){
 	MPU6050_Init(&hi2c1);
 
@@ -624,7 +625,7 @@ void vReadLocalSensorsTask(void *pvParameters)
             xSemaphoreGive(xDataMutex);
         }
 
-        // Run this task at a faster rate (e.g., 50ms)
+        // Run this task at a faster rate (50ms)
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
@@ -768,9 +769,6 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   /*
    * This ISR updates the volatile can_buttons array.
-   * The logic is kept from the original as it's simple and fast.
-   * vReadLocalSensorsTask is responsible for safely copying this
-   * volatile data into the main data structure.
    */
   uint32_t current_time = HAL_GetTick(); // Get current time in milliseconds
 
@@ -795,7 +793,7 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
       break;
 
     case GPIO_PIN_10:
-      // Check if debounce time has passed for PB2
+      // Check if debounce time has passed for PB10
       if (current_time - last_press_time[2] > DEBOUNCE_TIME_MS)
       {
         can_buttons[2] ^= 1;
