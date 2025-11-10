@@ -296,7 +296,6 @@ function love.update(dt)
         Connection_Status = "Connection lost. Reconnecting..."
         debugInfo.lastPacketTime = 0 -- Reset timer to prevent this from firing repeatedly
         
-        -- ### FIX 3: Added this line to re-start the ping loop ###
         isConnected = false
         
         -- Reset all data to a safe "off" state
@@ -510,4 +509,5 @@ function love.keypressed(key)
    if key == "escape" then
       love.event.quit()
    end
+
 end
