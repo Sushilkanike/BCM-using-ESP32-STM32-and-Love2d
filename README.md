@@ -22,7 +22,7 @@ The project is divided into three distinct nodes forming an end-to-end data pipe
     * Parses strings (e.g., `SPEED:60;FUEL:75`).
     * Updates a graphical dashboard in real-time.
 
-![System Diagram](path/to/your/images/system_diagram.png)
+![System Diagram](Images/Top_level_Design.png)
 *Figure 1: Top Level System Diagram*
 
 ## 🛠 Hardware & Software
