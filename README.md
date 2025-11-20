@@ -23,6 +23,7 @@ The project is divided into three distinct nodes forming an end-to-end data pipe
     * Updates a graphical dashboard in real-time.
 
 ![System Diagram](Images/Top_level_Design.png)
+
 *Figure 1: Top Level System Diagram*
 
 ## 🛠 Hardware & Software
@@ -36,6 +37,11 @@ The project is divided into three distinct nodes forming an end-to-end data pipe
 * **Slide Potentiometer** (Simulating Fuel Level)
 * **Tactile Pushbuttons** (x6)
 * Breadboards and Jumper Wires
+
+![Hardware Diagram](Images/Board_with_Labels.png)
+
+*Figure 2: Hardware Required*
+
 
 ### Software Tools
 * **STM32CubeIDE:** For STM32 firmware (C, HAL APIs).
@@ -79,6 +85,11 @@ The project is divided into three distinct nodes forming an end-to-end data pipe
 2.  Navigate to the `Dashboard_Lua` folder.
 3.  Run the application (drag the folder onto the `love.exe` or run via command line).
 4.  The dashboard will listen on the configured UDP port.
+
+![System Diagram](Images/Lua_Dashboard_connected.png)
+
+*Figure 3: Lua LÖVE2D Dashboard*
+
 
 ## 📡 Communication Protocol
 
